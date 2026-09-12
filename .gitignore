@@ -1,0 +1,21 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Python (if we end up there)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node (if we end up there)
+node_modules/
+dist/
+.env
+
+# LLM / local stuff
+*.local
+
+# Editor
+.vscode/
+.idea/
