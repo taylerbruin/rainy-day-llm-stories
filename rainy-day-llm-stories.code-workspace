@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"files.exclude": {
+			"**/.git": true
+		}
+	},
+	"extensions": {
+		"recommendations": [
+			"ollama.ollama"
+		]
+	}
+}
