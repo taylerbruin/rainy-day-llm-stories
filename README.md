@@ -22,6 +22,9 @@ A personal project for running long-form, interactive stories powered by local L
 
 *Decisions pending — see `notes/` for ideas and discussion.*
 
+- **Performance findings** from turn-timing benchmarks (KV-cache warm/cold
+  behavior, what actually makes a step slow) → [`notes/performance.md`](notes/performance.md)
+
 ## Getting Started
 
 *(To be filled in once the core loop exists.)*
