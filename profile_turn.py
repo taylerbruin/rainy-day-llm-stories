@@ -27,6 +27,7 @@ Usage:
     python profile_turn.py worst --runs 3
     python profile_turn.py --dry-run       # check services + report context size
     python profile_turn.py --no-prewarm    # skip the warm-up calls (colder cache)
+    python profile_turn.py worst --no-image --backend llamacpp   # A/B vs llama.cpp
 
 Keep VS Code (and its Copilot process) closed while profiling for clean
 numbers — the Qwen 27B model shares the RTX 5090's VRAM with everything else.
@@ -65,6 +66,13 @@ COMFYUI_RUN_BAT = os.environ.get(
 
 MODEL = "orcarouter/Qwen3.8-27B-128k"
 CONTEXT_LIMIT = 131_072  # tokens, matches CONTEXT_LIMIT in story.svelte.ts
+
+# Which local LLM backend to profile: "ollama" (default) or "llamacpp"
+# (a local llama-server speaking the OpenAI-compatible API). Both load the
+# SAME GGUF weights, so an A/B compares the serving layer, not the model.
+BACKEND: str = os.environ.get("LLM_BACKEND", "ollama").lower()
+LLAMA_URL = os.environ.get("LLAMA_URL", "http://localhost:8080")
+LLAMA_MODEL = os.environ.get("LLAMA_MODEL", "qwen3.8-27b")
 
 # ~4 characters per token — the same heuristic the app's context meter uses.
 CHARS_PER_TOKEN = 4
@@ -138,6 +146,8 @@ def chat(
     you can *feel* the generation speed. The Qwen3.8 reasoning pass is skipped
     whenever the module-level ``THINK`` flag is False (set via --no-think).
     """
+    if BACKEND == "llamacpp":
+        return _llama_chat(messages, max_tokens=max_tokens, temperature=temperature, stream=stream)
     if stream:
         return _chat_stream(messages, max_tokens=max_tokens, temperature=temperature)
     payload = {
@@ -218,6 +228,120 @@ def _chat_stream(messages: list[dict], max_tokens: int = 500, temperature: float
                 completion_tokens = int(obj.get("eval_count", 0))
     if parts:
         print(flush=True)  # terminate the streamed line
+    return ChatResult(
+        content="".join(parts),
+        elapsed=time.perf_counter() - started,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
+
+
+# ---------------------------------------------------------------------------
+# llama.cpp (llama-server, OpenAI-compatible)
+# ---------------------------------------------------------------------------
+
+def _llama_chat(
+    messages: list[dict],
+    max_tokens: int = 500,
+    temperature: float = 0.7,
+    stream: bool = False,
+) -> ChatResult:
+    """Talk to a local llama-server via the OpenAI-compatible chat API.
+
+    Sampling params are top-level (``max_tokens``), not under ``options``.
+    The Qwen3.8 reasoning pass is skipped (when THINK is False) via
+    ``chat_template_kwargs.enable_thinking`` — the llama.cpp analogue of
+    Ollama's ``think: false``.
+    """
+    url = f"{LLAMA_URL}/v1/chat/completions"
+    payload: dict = {
+        "model": LLAMA_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": stream,
+    }
+    if not THINK:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    if stream:
+        payload["stream_options"] = {"include_usage": True}
+        return _llama_stream(url, payload)
+
+    started = time.perf_counter()
+    status, body = http_post_json(url, payload)
+    elapsed = time.perf_counter() - started
+    content = ""
+    prompt_tokens = 0
+    completion_tokens = 0
+    if isinstance(body, dict):
+        choices = body.get("choices") or []
+        if choices:
+            content = choices[0].get("message", {}).get("content", "") or ""
+        usage = body.get("usage") or {}
+        prompt_tokens = int(usage.get("prompt_tokens", 0))
+        completion_tokens = int(usage.get("completion_tokens", 0))
+    return ChatResult(
+        content=content,
+        elapsed=elapsed,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
+
+
+def _llama_stream(url: str, payload: dict) -> ChatResult:
+    """SSE streaming against llama-server. Emits tokens to stdout as they arrive.
+
+    Deltas arrive as ``choices[0].delta.content``; some builds put the
+    reasoning trace in ``delta.reasoning_content`` — we stream that too.
+    ``usage`` (prompt/completion tokens) arrives in the final chunk when
+    ``stream_options.include_usage`` is set.
+    """
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    started = time.perf_counter()
+    parts: list[str] = []
+    prompt_tokens = 0
+    completion_tokens = 0
+    in_thinking = False
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as res:
+        for raw in res:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":
+                continue
+            try:
+                obj = json.loads(data)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            usage = obj.get("usage")
+            if isinstance(usage, dict):
+                prompt_tokens = int(usage.get("prompt_tokens", prompt_tokens))
+                completion_tokens = int(usage.get("completion_tokens", completion_tokens))
+            choices = obj.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {}) or {}
+            think_chunk = delta.get("reasoning_content") or delta.get("thinking") or ""
+            if think_chunk:
+                if not in_thinking:
+                    print("  \u27e8thinking\u2026 \u27e9", end="", flush=True)
+                    in_thinking = True
+                print(think_chunk, end="", flush=True)
+            content_chunk = delta.get("content") or ""
+            if content_chunk:
+                if in_thinking:
+                    print(" \u27e9", end="", flush=True)
+                    in_thinking = False
+                parts.append(content_chunk)
+                print(content_chunk, end="", flush=True)
+    if parts:
+        print(flush=True)
     return ChatResult(
         content="".join(parts),
         elapsed=time.perf_counter() - started,
@@ -645,6 +769,7 @@ class TurnResult:
     context_tokens_estimate: int
     steps: list[dict] = field(default_factory=list)
     total_elapsed_s: float = 0.0
+    backend: str = "ollama"
 
     def step_times(self) -> dict[str, float]:
         out: dict[str, float] = {}
@@ -673,6 +798,7 @@ def run_turn(mode: str, allow_image: bool, verbose: bool, target_chars: int) -> 
         timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         model=MODEL,
         context_tokens_estimate=est,
+        backend=BACKEND,
     )
     print(f"\n=== Turn [{mode}] — context ≈ {est:,} est. tokens "
           f"({est / CONTEXT_LIMIT * 100:.1f}% of the 128k window) ===")
@@ -711,7 +837,8 @@ def run_turn(mode: str, allow_image: bool, verbose: bool, target_chars: int) -> 
 # ---------------------------------------------------------------------------
 
 def prewarm(allow_image: bool) -> None:
-    print("Prewarming Ollama (first run loads the 27B into VRAM)…")
+    backend_name = "Ollama" if BACKEND == "ollama" else "llama.cpp"
+    print(f"Prewarming {backend_name} (first run loads the 27B into VRAM)…")
     t0 = time.perf_counter()
     chat(
         [
@@ -720,7 +847,7 @@ def prewarm(allow_image: bool) -> None:
         ],
         max_tokens=10,
     )
-    print(f"  Ollama warm call done in {time.perf_counter() - t0:.1f}s")
+    print(f"  {backend_name} warm call done in {time.perf_counter() - t0:.1f}s")
 
     if allow_image:
         try:
@@ -782,7 +909,22 @@ def print_summary(results: list[TurnResult]) -> None:
     print(f"\nArtifacts: results → {RESULTS_PATH.name}, chart → {CHART_PATH.name}")
 
 
+def _series_key(r: dict) -> str:
+    """Group runs by backend + mode (+ context size) so A/B lines stay separate."""
+    return f"{r.get('backend', 'ollama')} · {r['mode']} · {r.get('context_tokens_estimate', 0):,} tok"
+
+
 def make_chart() -> None:
+    """Plot EVERY run (not just an average).
+
+    Two panels:
+      A) total turn time per run — one line per (backend, mode, context) series,
+         x = run index within the series. This is the honest A/B view: you see
+         each individual run, including cold vs warm.
+      B) mean step breakdown per series (bars), so you can see *where* time goes.
+
+    Older results that predate the `backend` field are treated as "ollama".
+    """
     results = load_results()
     if not results:
         return
@@ -794,18 +936,13 @@ def make_chart() -> None:
         print("matplotlib not installed — skipping chart (pip install matplotlib)")
         return
 
-    # Aggregate: one bar group per (mode) with the MEAN step time.
     from collections import defaultdict
+    from matplotlib import cm
 
-    per_mode: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
-    totals: dict[str, list[float]] = defaultdict(list)
+    # Keep file order (chronological), but group into series for the line plot.
+    series: dict[str, list[dict]] = defaultdict(list)
     for r in results:
-        mode = r["mode"]
-        totals[mode].append(r["total_elapsed_s"])
-        for s in r["steps"]:
-            key = s["step"].split("_", 1)[1] if "_" in s["step"] else s["step"]
-            if s.get("ok", True):
-                per_mode[mode][key].append(s.get("elapsed_s", 0.0))
+        series[_series_key(r)].append(r)
 
     labels = {
         "draft_reply": "1. draft reply",
@@ -815,30 +952,59 @@ def make_chart() -> None:
         "image_decision": "4a. image decision",
         "comfyui_generate": "4b. comfyui image",
     }
-    modes = sorted(per_mode.keys())
-    all_keys = sorted({k for m in per_mode.values() for k in m.keys()},
-                      key=lambda k: (list(labels).index(k) if k in labels else 99, k))
+    key_order = list(labels.keys())
+    n_series = max(len(series), 1)
+    colors = [cm.tab10(i % 10) for i in range(n_series)]
 
-    fig, ax = plt.subplots(figsize=(11, 6))
-    x = range(len(all_keys))
-    width = 0.8 / max(len(modes), 1)
-    for i, mode in enumerate(modes):
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 9),
+                                   gridspec_kw={"height_ratios": [1.2, 1.0]})
+
+    # ---- Panel A: one line per series, every run as a point ----
+    for color, (name, runs) in zip(colors, series.items()):
+        xs = list(range(len(runs)))
+        ys = [max(r["total_elapsed_s"], 1e-3) for r in runs]
+        ax1.plot(xs, ys, marker="o", linewidth=1.6, color=color, label=name)
+        for xi, yi in zip(xs, ys):
+            ax1.annotate(f"{yi:.1f}", (xi, yi), textcoords="offset points",
+                         xytext=(0, 8), ha="center", fontsize=7, color=color)
+    ax1.set_yscale("log")
+    ax1.set_xlabel("run index within series (chronological)")
+    ax1.set_ylabel("total turn time (s, log scale)")
+    ax1.set_title("Rainy Day LLM Stories — total turn time per run (A/B by backend)")
+    ax1.legend(fontsize=8, loc="upper left")
+    ax1.grid(axis="y", which="both", alpha=0.3)
+
+    # ---- Panel B: mean step breakdown per series ----
+    per_series_steps: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for r in results:
+        key = _series_key(r)
+        for s in r.get("steps", []):
+            name = s["step"].split("_", 1)[1] if "_" in s["step"] else s["step"]
+            if s.get("ok", True):
+                per_series_steps[key][name].append(s.get("elapsed_s", 0.0))
+
+    present_keys = [k for k in key_order if any(k in per_series_steps[m] for m in per_series_steps)]
+    all_series = list(per_series_steps.keys())
+    x = range(len(present_keys))
+    width = 0.8 / max(len(all_series), 1)
+    for i, sname in enumerate(all_series):
         vals = []
-        for k in all_keys:
-            series = per_mode[mode].get(k)
-            vals.append(sum(series) / len(series) if series else 0.0)
-        ax.bar([xi + (i - (len(modes) - 1) / 2) * width for xi in x], vals,
-               width=width, label=f"{mode} (avg) + total {sum(totals[mode]) / len(totals[mode]):.1f}s")
-    ax.set_yscale("log")
-    ax.set_xticks(list(x))
-    ax.set_xticklabels([labels.get(k, k) for k in all_keys], rotation=20, ha="right")
-    ax.set_ylabel("mean step time (s, log scale)")
-    ax.set_title("Rainy Day LLM Stories — turn step breakdown")
-    ax.legend(fontsize=9)
-    ax.grid(axis="y", which="both", alpha=0.3)
+        for k in present_keys:
+            seq = per_series_steps[sname].get(k)
+            vals.append(sum(seq) / len(seq) if seq else 0.0)
+        ax2.bar([xi + (i - (len(all_series) - 1) / 2) * width for xi in x],
+                [max(v, 1e-3) for v in vals], width=width, color=colors[i % len(colors)], label=sname)
+    ax2.set_yscale("log")
+    ax2.set_xticks(list(x))
+    ax2.set_xticklabels([labels.get(k, k) for k in present_keys], rotation=20, ha="right")
+    ax2.set_ylabel("mean step time (s, log scale)")
+    ax2.set_title("Mean step breakdown per series")
+    ax2.legend(fontsize=7, loc="upper right")
+    ax2.grid(axis="y", which="both", alpha=0.3)
+
     fig.tight_layout()
     fig.savefig(CHART_PATH, dpi=130)
-    print(f"Chart saved → {CHART_PATH}")
+    print(f"Chart saved → {CHART_PATH}  ({len(results)} runs, {n_series} series)")
 
 
 # ---------------------------------------------------------------------------
@@ -881,20 +1047,33 @@ def comfyui_start(bat: str, wait_s: int = 120) -> bool:
 
 def check_services(allow_image: bool, no_start: bool = False) -> bool:
     ok = True
-    try:
-        status, body = http_get(f"{OLLAMA_URL}/api/tags")
-        names = [m.get("name") for m in body.get("models", [])] if isinstance(body, dict) else []
-        print(f"Ollama: up at {OLLAMA_URL}")
-        # Ollama lists tagged names (e.g. "model:latest"); a request for the
-        # untagged name resolves to :latest, so compare tag-stripped too.
-        stripped = {n.split(":", 1)[0] for n in names}
-        if MODEL in names or MODEL in stripped:
-            print(f"  model present: {MODEL}")
-        else:
-            print(f"  WARNING: {MODEL} not in {names}")
-    except Exception as err:  # noqa: BLE001
-        print(f"Ollama: DOWN — {err}")
-        ok = False
+    if BACKEND == "llamacpp":
+        try:
+            status, body = http_get(f"{LLAMA_URL}/v1/models", timeout=5)
+            ids = [m.get("id") for m in body.get("data", [])] if isinstance(body, dict) else []
+            print(f"llama.cpp: up at {LLAMA_URL}")
+            if ids:
+                print(f"  model(s) loaded: {ids}")
+            else:
+                print("  WARNING: no models listed")
+        except Exception as err:  # noqa: BLE001
+            print(f"llama.cpp: DOWN — {err}")
+            ok = False
+    else:
+        try:
+            status, body = http_get(f"{OLLAMA_URL}/api/tags")
+            names = [m.get("name") for m in body.get("models", [])] if isinstance(body, dict) else []
+            print(f"Ollama: up at {OLLAMA_URL}")
+            # Ollama lists tagged names (e.g. "model:latest"); a request for the
+            # untagged name resolves to :latest, so compare tag-stripped too.
+            stripped = {n.split(":", 1)[0] for n in names}
+            if MODEL in names or MODEL in stripped:
+                print(f"  model present: {MODEL}")
+            else:
+                print(f"  WARNING: {MODEL} not in {names}")
+        except Exception as err:  # noqa: BLE001
+            print(f"Ollama: DOWN — {err}")
+            ok = False
     if allow_image:
         if comfyui_up():
             print(f"ComfyUI: up at {COMFYUI_URL}")
@@ -908,6 +1087,7 @@ def check_services(allow_image: bool, no_start: bool = False) -> bool:
 
 
 def main() -> int:
+    global THINK, BACKEND
     parser = argparse.ArgumentParser(description="Profile one full story turn (best/worst/auto).")
     parser.add_argument("modes", nargs="?", choices=["best", "worst", "auto"],
                         default="auto", help="Run mode (default: auto)")
@@ -922,11 +1102,14 @@ def main() -> int:
                              "Lower = shorter context = faster, e.g. --context 0.25")
     parser.add_argument("--no-think", action="store_true",
                         help="Skip Qwen3.8's reasoning pass (faster; model answers straight away)")
+    parser.add_argument("--backend", choices=["ollama", "llamacpp"], default=BACKEND,
+                        help="Local LLM backend to profile (default: ollama). "
+                             "llamacpp talks to a llama-server at LLAMA_URL.")
     parser.add_argument("--dry-run", action="store_true", help="Check services and report context size, then exit")
     args = parser.parse_args()
 
-    global THINK
     THINK = not args.no_think
+    BACKEND = args.backend
     modes = [args.modes] if args.modes else ["auto"]
     allow_image = not args.no_image
     if not 0.0 < args.context <= 1.0:
@@ -934,11 +1117,15 @@ def main() -> int:
         return 1
 
     print("Rainy Day LLM Stories — turn profiler")
+    if BACKEND == "llamacpp":
+        print(f"Backend: llamacpp → {LLAMA_URL} (model '{LLAMA_MODEL}')")
+    else:
+        print(f"Backend: ollama → {OLLAMA_URL}")
     print(f"Model: {MODEL}")
     print(f"Reasoning pass: {'OFF (--no-think)' if not THINK else 'on (default)'}")
     # In a dry run we only report — we don't spawn a server just to check it.
     if not check_services(allow_image, no_start=args.no_start or args.dry_run):
-        print("\nOllama is not reachable — aborting (fix the service and re-run).")
+        print(f"\nBackend ({BACKEND}) is not reachable — aborting (fix the service and re-run).")
         return 1
 
     # Reserve headroom for prompts + output, then scale down by --context.
