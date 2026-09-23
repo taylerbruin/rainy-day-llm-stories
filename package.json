@@ -5,18 +5,23 @@
   "type": "module",
   "description": "A local, browser-based AI story experience powered by Ollama.",
   "scripts": {
-    "dev": "vite",
+    "dev": "concurrently -k -n server,client -c blue,green \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "node --watch server/index.js",
+    "dev:client": "vite",
+    "start": "node server/index.js",
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json"
   },
   "dependencies": {
+    "better-sqlite3": "^13.0.3",
     "dexie": "^4.4.6"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.3.0",
     "@tailwindcss/vite": "^4.3.3",
     "@tsconfig/svelte": "^5.0.8",
+    "concurrently": "^10.0.5",
     "svelte": "^5.57.0",
     "svelte-check": "^4.7.6",
     "tailwindcss": "^4.3.3",
