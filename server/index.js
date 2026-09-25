@@ -20,6 +20,11 @@ import worldsRouter from './routes/worlds.js';
 import storyRouter from './routes/story.js';
 import transcriptRouter from './routes/transcript.js';
 import chaptersRouter from './routes/chapters.js';
+import worldStateRouter from './routes/world-state.js';
+import charactersRouter from './routes/characters.js';
+import placesRouter from './routes/places.js';
+import savesRouter from './routes/saves.js';
+import compactRouter from './routes/compact.js';
 
 const PORT = process.env.PORT || 3000;
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
@@ -63,6 +68,11 @@ app.use('/api/worlds', worldsRouter);
 app.use('/api', storyRouter); // POST /api/narrate, POST /api/choices
 app.use('/api/chapters', chaptersRouter); // immutable history: POST /, GET /?worldId=N, GET /:id, PATCH /:id, DELETE /:id
 app.use('/api/transcript', transcriptRouter); // the book: POST /, GET /?chapterId=N, GET /:id, DELETE /:id
+app.use('/api/world-state', worldStateRouter); // live canon (1 row per world): GET /:worldId, PUT /:worldId
+app.use('/api/characters', charactersRouter); // spec sheets: GET /?worldId=N, GET/POST /, PATCH/DELETE /:id
+app.use('/api/places', placesRouter); // location sheets: GET /?worldId=N, GET/POST /, PATCH/DELETE /:id (startingMood immutable)
+app.use('/api/saves', savesRouter); // linear save list: GET /?worldId=N, GET/POST /, PATCH (rename only) /DELETE /:id — latest-state-only resume points
+app.use('/api/compact', compactRouter); // PROPOSE step of chapter close: POST / — LLM compaction call → record for the review modal (no writes; apply = POST /api/chapters/:id/close)
 
 // ── Errors & 404 (order matters: these catch everything above) ──
 // Spring's @ExceptionHandler / HandlerExceptionResolver equivalent:

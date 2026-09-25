@@ -16,6 +16,10 @@
 			"/^node test_chapters_api\\.mjs$/": {
 				"approve": true,
 				"matchCommandLine": true
+			},
+			"/^node test_worldstate_api\\.mjs$/": {
+				"approve": true,
+				"matchCommandLine": true
 			}
 		}
 	},

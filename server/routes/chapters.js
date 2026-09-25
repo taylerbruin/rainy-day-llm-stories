@@ -6,6 +6,7 @@
 //   @PostMapping("")            → create a chapter (chapter-close / compact output)
 //   @GetMapping("?worldId=")    → a world's chapters, in seq order
 //   @GetMapping("/{id}")        → one chapter WITH its events/characters/places
+//   @PostMapping("/{id}/close") → APPLY the player-approved compaction (compact.js proposes)
 //   @PatchMapping("/{id}")      → close a chapter (set summary/wordCount/closedAt)
 //   @DeleteMapping("/{id}")     → delete (cascades to children)
 //
@@ -175,6 +176,176 @@ router.get('/:id', (req, res) => {
   const row = getChapterFull(req.params.id);
   if (!row) throw httpError(404, `chapter ${req.params.id} not found`);
   res.json(row);
+});
+
+// ── POST /:id/close — APPLY the player-approved compaction ───────
+// The write-half of the compact flow (compact.js is the propose-half).
+// compact.js returns a lenient DRAFT for the review modal (unknown
+// refs dropped + warned); here the record is the PLAYER'S APPROVED
+// data, so validation is STRICT — a ghost id or bad type is 400/404
+// and the transaction rolls back, leaving the chapter open.
+// (Spring: the same DTO validated at two gates — a lenient @JsonPatch
+//  draft, then full @Valid in the service that actually writes.)
+//
+// Body: { title, summary,
+//         events: [{kind?, what, detail?}], characters: [{characterId, involvement?}],
+//         places: [placeId],
+//         worldStateUpdate?: { establishedFacts?, openThreads?, currentLocationId? },
+//         applyWorldUpdate?: boolean (default true),
+//         characterLocations?: [{characterId, currentLocationId?|null}] }
+function normalizeWorldStateUpdate(wsu) {
+  if (wsu === undefined || wsu === null) return null; // no world-state commit this close
+  if (typeof wsu !== 'object' || Array.isArray(wsu)) throw httpError(400, 'worldStateUpdate must be an object');
+
+  const facts = wsu.establishedFacts === undefined ? null : (
+    !Array.isArray(wsu.establishedFacts)
+      ? (() => { throw httpError(400, 'worldStateUpdate.establishedFacts must be an array of strings'); })()
+      : wsu.establishedFacts.map((f, i) => {
+          if (typeof f !== 'string' || !f.trim()) throw httpError(400, `establishedFacts[${i}] must be a non-empty string`);
+          return f.trim();
+        })
+  );
+
+  const threads = wsu.openThreads === undefined ? null : (
+    !Array.isArray(wsu.openThreads)
+      ? (() => { throw httpError(400, 'worldStateUpdate.openThreads must be an array of {thread, detail?}'); })()
+      : wsu.openThreads.map((t, i) => {
+          if (!t || typeof t.thread !== 'string' || !t.thread.trim()) {
+            throw httpError(400, `openThreads[${i}].thread (non-empty string) is required`);
+          }
+          const detail = t.detail === undefined ? null : t.detail;
+          if (detail !== null && typeof detail !== 'string') throw httpError(400, `openThreads[${i}].detail must be a string or null`);
+          return { thread: t.thread.trim(), detail };
+        })
+  );
+
+  let location = null;
+  if (wsu.currentLocationId !== undefined && wsu.currentLocationId !== null) {
+    if (typeof wsu.currentLocationId !== 'number') throw httpError(400, 'worldStateUpdate.currentLocationId must be a number or null');
+    location = wsu.currentLocationId;
+  }
+  return { facts, threads, location };
+}
+
+function normalizeCharacterLocations(locations, worldId) {
+  if (locations === undefined || locations === null) return [];
+  if (!Array.isArray(locations)) throw httpError(400, 'characterLocations must be an array of {characterId, currentLocationId?}');
+  return locations.map((l, i) => {
+    if (typeof l?.characterId !== 'number') throw httpError(400, `characterLocations[${i}].characterId (number) is required`);
+    if (!db.prepare('SELECT id FROM character WHERE id = ? AND world_id = ?').get(l.characterId, worldId)) {
+      throw httpError(404, `character ${l.characterId} not found in this chapter's world`);
+    }
+    let loc = null;
+    if (l.currentLocationId !== undefined && l.currentLocationId !== null) {
+      if (typeof l.currentLocationId !== 'number') throw httpError(400, `characterLocations[${i}].currentLocationId must be a number or null`);
+      if (!db.prepare('SELECT id FROM place WHERE id = ? AND world_id = ?').get(l.currentLocationId, worldId)) {
+        throw httpError(404, `place ${l.currentLocationId} not found in this chapter's world`);
+      }
+      loc = l.currentLocationId;
+    }
+    return { characterId: l.characterId, currentLocationId: loc };
+  });
+}
+
+function readWorldState(worldId) {
+  const row = db.prepare('SELECT * FROM world_state WHERE id = ?').get(worldId);
+  return {
+    id: Number(worldId),
+    established_facts: row?.established_facts ? JSON.parse(row.established_facts) : [],
+    open_threads: row?.open_threads ? JSON.parse(row.open_threads) : [],
+    current_location_id: row?.current_location_id ?? null,
+  };
+}
+
+router.post('/:id/close', (req, res) => {
+  const id = req.params.id;
+  const chapter = db.prepare('SELECT * FROM chapter WHERE id = ?').get(id);
+  if (!chapter) throw httpError(404, `chapter ${id} not found`);
+  if (chapter.closed_at) throw httpError(409, `chapter ${id} is already closed — its record is immutable`);
+
+  const b = req.body ?? {};
+  if (typeof b.title !== 'string' || !b.title.trim()) throw httpError(400, 'title (non-empty string) is required');
+  if (typeof b.summary !== 'string' || !b.summary.trim()) throw httpError(400, 'summary (non-empty string) is required');
+
+  // Reuse the strict child normalizers from the create path (they
+  // 404 ghost ids; unknown event kinds 400) — same contract the
+  // review modal was built against.
+  const events = normalizeEvents(b.events);
+  const characters = normalizeCharacters(b.characters);
+  const places = normalizePlaces(b.places);
+
+  const worldStateUpdate = normalizeWorldStateUpdate(b.worldStateUpdate);
+  const applyWorld = b.applyWorldUpdate === undefined ? true : b.applyWorldUpdate;
+  if (applyWorld && worldStateUpdate) {
+    const { facts, threads, location } = worldStateUpdate;
+    if (location !== null && !db.prepare('SELECT id FROM place WHERE id = ? AND world_id = ?').get(location, chapter.world_id)) {
+      throw httpError(404, `worldStateUpdate.currentLocationId ${location} not found in this world`);
+    }
+  }
+  const characterLocations = normalizeCharacterLocations(b.characterLocations, chapter.world_id);
+
+  // ── The commit: ONE transaction, all-or-nothing ─────────────────
+  // Stamping closed_at inside the tx (not via PATCH) keeps the
+  // invariant "closed_at set ⇔ the record was written" transactional.
+  const tx = db.transaction(() => {
+    // word_count = the transcript's word length (schema 006: "raw
+    // transcript length (close-gate = 5000)") — the same metric
+    // compact.js reports as `wordCount`, so the two agree.
+    const wordCount = db
+      .prepare('SELECT content FROM transcript WHERE chapter_id = ?')
+      .all(id)
+      .reduce((n, r) => n + (r.content ? r.content.split(/\s+/).filter(Boolean).length : 0), 0);
+
+    db.prepare('UPDATE chapter SET title = ?, summary = ?, word_count = ?, closed_at = datetime(\'now\') WHERE id = ?')
+      .run(b.title.trim(), b.summary.trim(), wordCount, id);
+
+    db.prepare('DELETE FROM chapter_event WHERE chapter_id = ?').run(id);
+    const insEvent = db.prepare('INSERT INTO chapter_event (chapter_id, kind, what, detail, seq) VALUES (?, ?, ?, ?, ?)');
+    events.forEach((e, i) => insEvent.run(id, e.kind, e.what, e.detail, i + 1));
+
+    db.prepare('DELETE FROM chapter_character WHERE chapter_id = ?').run(id);
+    const insChar = db.prepare('INSERT INTO chapter_character (chapter_id, character_id, involvement) VALUES (?, ?, ?)');
+    characters.forEach((c) => insChar.run(id, c.characterId, c.involvement));
+
+    db.prepare('DELETE FROM chapter_place WHERE chapter_id = ?').run(id);
+    const insPlace = db.prepare('INSERT INTO chapter_place (chapter_id, place_id) VALUES (?, ?)');
+    places.forEach((p) => insPlace.run(id, p.placeId));
+
+    if (applyWorld && worldStateUpdate) {
+      const { facts, threads, location } = worldStateUpdate;
+      const existing = db.prepare('SELECT * FROM world_state WHERE id = ?').get(chapter.world_id);
+      if (existing) {
+        db.prepare('UPDATE world_state SET established_facts = ?, open_threads = ?, current_location_id = ? WHERE id = ?').run(
+          facts !== null ? JSON.stringify(facts) : existing.established_facts,
+          threads !== null ? JSON.stringify(threads) : existing.open_threads,
+          location !== null ? location : existing.current_location_id,
+          chapter.world_id,
+        );
+      } else {
+        db.prepare('INSERT INTO world_state (id, established_facts, open_threads, current_location_id) VALUES (?, ?, ?, ?)').run(
+          chapter.world_id,
+          facts ? JSON.stringify(facts) : null,
+          threads ? JSON.stringify(threads) : null,
+          location,
+        );
+      }
+    }
+
+    characterLocations.forEach((l) =>
+      db.prepare('UPDATE character SET current_location_id = ? WHERE id = ?').run(l.currentLocationId, l.characterId),
+    );
+  });
+  tx();
+
+  // Fresh read-back (the "return the entity after the write" pattern):
+  // the immutable chapter record + the canon now established, so the
+  // client's world-state cache and character cache can be updated from
+  // one response.
+  res.json({
+    chapter: getChapterFull(id),
+    worldState: readWorldState(chapter.world_id),
+    characterLocations,
+  });
 });
 
 // PATCH /api/chapters/:id — the "close the chapter" moment.
