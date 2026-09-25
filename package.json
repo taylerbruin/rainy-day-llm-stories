@@ -15,7 +15,8 @@
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",
-    "dexie": "^4.4.6"
+    "dexie": "^4.4.6",
+    "express": "^5.2.1"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.3.0",

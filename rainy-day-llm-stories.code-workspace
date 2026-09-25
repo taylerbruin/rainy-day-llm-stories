@@ -7,6 +7,16 @@
 	"settings": {
 		"files.exclude": {
 			"**/.git": true
+		},
+		"chat.tools.terminal.autoApprove": {
+			"/^node server/index\\.js$/": {
+				"approve": true,
+				"matchCommandLine": true
+			},
+			"/^node test_chapters_api\\.mjs$/": {
+				"approve": true,
+				"matchCommandLine": true
+			}
 		}
 	},
 	"extensions": {
